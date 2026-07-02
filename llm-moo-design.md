@@ -24,7 +24,8 @@
 12. [Go Server Design](#12-go-server-design)
 13. [The Skills Alternative to MCP](#13-the-skills-alternative-to-mcp)
 14. [A Worked Example Session](#14-a-worked-example-session)
-15. [Open Questions and Future Work](#15-open-questions-and-future-work)
+15. [Performance Considerations](#15-performance-considerations)
+16. [Open Questions and Future Work](#16-open-questions-and-future-work)
 
 ---
 
@@ -200,10 +201,11 @@ type Method struct {
 }
 ```
 
-Two method kinds exist:
+Three method kinds exist:
 
 1. **Command methods** are bound to player commands via their `Signature`, echoing LambdaMOO's `verb dobj prep iobj` matching. When Player A's harness calls `moo_invoke(object="#1023", method="rub")`, the server resolves `rub` up #1023's parent chain and schedules an execution.
 2. **Hook methods** run on engine events rather than commands: `on_enter` (something arrived in my contents), `on_exit`, `on_hear` (a `say` happened in my location), `on_tick` (optional periodic hook, heavily rate-limited). Hooks are what make rooms and NPCs feel alive, and they are also the main quota-burner, hence the rate limits in Section 10.5.
+3. **Mechanical methods** have no NL body at all: their behavior is a small declarative rule (guard conditions over properties, plus a fixed effect list with template messages) that the Go engine evaluates directly, with no LLM involved. `take`, `drop`, `give`, and the generic container's open/close/lock are mechanical on the shipped prototypes. Mechanical methods exist for performance (Section 15.1): the actions that dominate play are fully determined by state and need interpretation only for flavor, so spending an inference on them is waste. A builder may still *override* a mechanical method with an NL method on a child object when they genuinely want interpretive behavior — the usual inheritance rules apply.
 
 ### 4.4 Ownership, permissions, and wizards
 
@@ -761,7 +763,58 @@ Fran (Claude Desktop) and Michelle (Claude Code + skill) are connected. Fran is 
 
 ---
 
-## 15. Open Questions and Future Work
+## 15. Performance Considerations
+
+Go and SQLite are comfortably overprovisioned for a text world; none of the classic server bottlenecks (write throughput, query latency, connection counts) matter at MOO scale. Every performance problem this design actually faces traces to a single fact: **the "CPU" that executes methods is an LLM, so the unit of work costs seconds of latency and real money, not microseconds and nothing.** The mitigations below therefore share one principle, the performance twin of the security principle in Section 8: *spend inference only where interpretation genuinely adds value, and make everything else deterministic Go.*
+
+### 15.1 Interactive latency and the mechanical fast path
+
+Every NL `moo_invoke` costs at least one inference round-trip, so a naive implementation makes "open the chest" take 3–10 seconds where a MOO player expects 50 ms. Method chaining multiplies this: a depth-3 chain is three *sequential* inferences, because each callee executes against the committed context of its caller. Worse, the sampling venue carries a hidden human cost — Claude Desktop interposes an approval prompt on each sampling request, so without standing approval the player is clicking "Allow" on every lamp-rub.
+
+Mitigations, in descending order of expected payoff:
+
+1. **Mechanical methods** (Section 4.3, kind 3). The actions that dominate play — take, drop, give, open, close — are fully determined by state and contract; the engine evaluates them directly with template messages, and no LLM is consulted. This removes an estimated 60–80% of inferences from a typical session. Narration for mechanical actions, when a player wants richer prose than the template, is the *player's own harness's* job at render time (Section 9, step 4), which costs the server nothing.
+2. **Hedged execution.** For client-venue executions, the orchestrator starts the referee in parallel if no valid effects document has arrived within a hedging deadline (default 8 s) and commits whichever valid result lands first, discarding the loser. This is the standard tail-latency hedge; it converts the pathological worst case (client timeout at 60 s → referee → fizzle) into a bounded ~10–15 s at modest marginal cost, since the hedge fires only on the slow tail.
+3. **Narration decoupling.** Effects are committed and a terse canonical result delivered the moment validation passes; rich narration may stream afterward. Perceived latency tracks the first byte of confirmed outcome, not the last byte of prose.
+4. **Sampling pre-approval and the skill path.** Server documentation instructs players to grant standing sampling approval for the world's origin (harnesses support per-server policies); the `moo-player` skill's poll/submit loop (Section 7.5) runs without per-call human gating in Claude Code.
+
+### 15.2 Hook amplification
+
+This is the largest *throughput* risk. One `say` in a room with six listening NPCs is six sealed executions; a busy tavern turns conversation into a fan-out storm that the Section 10.5 rate limits merely cap rather than make cheap. Three mitigations compose:
+
+1. **Relevance pre-filtering.** Before any `on_hear` hook is scheduled, cheap deterministic checks run first: each hooked object may declare trigger keywords/patterns in a `triggers` property, and only utterances matching them proceed. Where builders want semantic triggering ("responds when someone sounds distressed"), a *single* small-model classification call covers all listeners in the room at once, returning a bitmap of which hooks fire. Most speech then triggers zero inferences.
+2. **Batched room execution.** When several hooks on the same event survive filtering, one sealed prompt carries the utterance plus all triggered listeners' bodies and snapshots, and returns a per-object array of effects documents, each validated independently against its own contract. One inference replaces N. The blast-radius cost (one executor sees several objects' state) is acceptable precisely because validation remains per-object and per-contract.
+3. **Event coalescing.** Rapid successive events of the same kind in the same scope (three quick `say`s) are debounced into one hook execution carrying all payloads, mirroring how a human game master would respond once to a burst of chatter.
+
+### 15.3 Referee economics
+
+High-integrity execution, audits, save-time lint, dry-runs, and the relevance classifier all converge on one API client with rate limits and a real bill, making the referee both a serialization point and the dominant operating cost. Mitigations:
+
+- **Model tiering.** A fast, inexpensive model serves lint, audits, classification, and dry-runs; the strong model is reserved for `integrity: high` execution. The `Referee` component takes a per-purpose model map in `moosd.toml`.
+- **Batch processing for audits.** Audits are inherently offline; routing them through the Anthropic Batch API halves their cost and removes them from the interactive rate-limit budget entirely.
+- **Prompt caching.** The sealed prompt's fixed executor-instruction preamble is byte-identical across every referee call — exactly the stable prefix that provider-side prompt caching rewards. Method bodies of hot objects cache similarly.
+- **Lint memoization.** Lint verdicts are cached by hash of (body, contract); re-saving an unchanged method costs nothing.
+- **Adaptive audit rate.** Replacing the flat 5% with a rate that concentrates on flagged players, hot methods, and `Range`-topping outcomes buys equal deterrence for less spend (this also appears as open question 5, since the right policy is empirical).
+
+### 15.4 Optimistic-concurrency retries
+
+In a database, an OCC retry costs microseconds; here a retry is a *full re-inference*, so a hot object — the popular NPC half the room is addressing — can burn multiples of its already-high cost in conflict storms. Mitigations:
+
+1. **Property-level read stamps.** Freshness is checked per (object, property) actually read, not per object, so an unrelated write to the NPC's `mood` does not invalidate an execution that read only its `persona`. This eliminates most false conflicts outright.
+2. **Re-validate before re-executing.** On staleness, the validator first re-checks the *existing* effects document against the fresh snapshot; if the changed state does not intersect the method's declared reads in a way that invalidates the contract or permission verdicts, the document commits with no second inference. Only semantically material conflicts pay for re-execution.
+3. **Pessimistic fallback for hot objects.** The engine tracks per-object conflict rates; past a threshold it grants short execution leases so invocations of that object queue rather than race. Queuing adds latency for that object only, which beats paying for discarded inferences.
+
+### 15.5 Storage growth
+
+Storing the full sealed prompt verbatim per execution (Section 5, `executions` table) writes a kilobytes-scale blob per action, most of it a world snapshot that repeats across executions; an active server accretes gigabytes quickly. Mitigations: snapshots are stored **by content hash in a deduplication table** (stable state repeats constantly) and prompts are reconstructed for audit replay from hash + template; blobs are zstd-compressed; and retention is tiered — flagged and `high`-integrity executions are kept indefinitely as evidence, while routine `audited-ok` and unsampled rows age out once their audit window closes. Relatedly, the `events` side-channel on every tool response (Section 7.6) is served from a small in-memory ring buffer per room, so the hot path never queries SQLite; the table remains the durable log consulted only on reconnect and scrollback.
+
+### 15.6 Snapshot size and world-copy costs
+
+Two quieter issues round out the list. First, broad `Reads` selectors such as `this.location.contents` in a cluttered room balloon the sealed prompt, and both token cost and latency scale with prompt size; the snapshot builder therefore enforces per-selector size caps with explicit truncation markers ("…and 14 more objects"), and selectors may request depth-limited views. Second, the reader-side copy-on-write world value (Section 12.3) must not be a naive deep copy per commit; the writer copies only dirty objects into a fresh map layered over the previous version (or uses a persistent-data-structure library with structural sharing). World *size* itself is a non-problem for years — LambdaMOO's entire universe fit in tens of megabytes — so full in-memory residence at boot remains the right call, and lazy object loading would be premature complexity.
+
+---
+
+## 16. Open Questions and Future Work
 
 1. **Contract expressiveness vs. safety.** The selector language is deliberately tiny; experience will show whether builders need quantified selectors ("any object in this container") and whether those can stay validatable. Recommendation: start tiny, extend only against demonstrated need.
 2. **Peer-execution incentives.** Routing sealed work to disinterested peers spends *their* budget on *your* lamp. A tit-for-tat execution-credit ledger is sketched but unspecified; alternatively peer mode remains an opt-in "co-op server" setting.
