@@ -1,7 +1,7 @@
-# NL-MOO: A Design for an LLM-Mediated, Multi-User Shared Object World
+# NL-MOO: An LLM-Mediated, Multi-User, Shared Object World
 
 **Status:** Draft for review  
-**Author:** Claude (at Fran's request)  
+**Author:** Claude Fable 5 (at Fran's request)  
 **Date:** 2026-07-02  
 **Implementation language (server):** Go  
 **Client integration:** MCP (Model Context Protocol) and/or Agent Skills
@@ -485,7 +485,7 @@ This is the heart of the design. Everything here serves one goal: **let untruste
 A method body is prose written *to the executing model*, in the voice of instructions to a scrupulous game master. Example — the brass lamp:
 
 > **Body:** When someone rubs the lamp: if `this.genie_present` is true, narrate the genie (#412) billowing out of the spout in purple smoke, set `this.genie_present` to false, set `this.description` to "A brass lamp, its surface now cold and tarnished.", and move #412 into the rubber's location. If `this.genie_present` is false, tell the rubber the lamp merely feels cold, and mention faint scratches near the spout if they examine closely. Never produce the genie twice.
-
+> 
 > **Contract:**
 > ```json
 > {
@@ -497,7 +497,7 @@ A method body is prose written *to the executing model*, in the voice of instruc
 >   "random":   false
 > }
 > ```
-
+> 
 > **Reads:** `["this.genie_present", "this.description", "caller.name", "caller.location"]`
 
 The separation is deliberate: the **body** is expressive, ambiguous-tolerant prose; the **contract** is a machine-checkable envelope the server enforces with zero natural-language understanding. A hostile or confused execution can, at absolute worst, do anything the contract allows — flip this lamp's boolean, rewrite this lamp's description, move the genie to the caller's room, and send messages to the room. It cannot touch gold balances, other players' inventories, or the map, no matter what the prose says or what the executing model hallucinates, because those effects are simply not in the envelope.
