@@ -85,29 +85,30 @@ What LambdaMOO got *wrong* for our purposes is the programming barrier: MOOcode 
 ### 3.1 Components
 
 ```
-                                             ┌───────────────────────────────┐
- ┌─────────────────────────┐                 │        NL-MOO Server (Go)     │
- │ Player A's LLM harness  │  MCP over       │                               │
- │ (Claude Desktop)        │  Streamable     │  ┌─────────┐   ┌───────────┐  │
- │  ┌──────────────────┐   │  HTTP(S)        │  │  World  │   │ Validator │  │
- │  │ Claude (model)   │◄──┼─────────────────┼─►│  Engine │◄─►│ (perms,   │  │
- │  │ + moo tools      │   │  tools, events, │  │ (single │   │ contracts,│  │
- │  └──────────────────┘   │  sampling       │  │ writer) │   │invariants)│  │
- └─────────────────────────┘                 │  └────┬────┘   └───────────┘  │
-                                             │       │                       │
- ┌─────────────────────────┐                 │  ┌────▼────┐   ┌───────────┐  │
- │ Player B's LLM harness  │  MCP            │  │  Store  │   │  Referee  │  │
- │ (Claude Code + skill)   │◄────────────────┼─►│ (SQLite │   │  (server- │  │
- └─────────────────────────┘                 │  │  WAL)   │   │  side LLM │  │
-                                             │  └─────────┘   │  client)  │  │
- ┌─────────────────────────┐                 │  ┌─────────┐   └───────────┘  │
- │ Player C's LLM harness  │  MCP            │  │  Event  │                  │
- └─────────────────────────┘◄────────────────┼─►│   Bus   │                  │
-                                             │  └─────────┘                  │
-                                             └───────────────────────────────┘
+                                        ┌──────────────────────────────────────────────┐
+ ┌─────────────────────────┐            │              NL-MOO Server (Go)              │
+ │ Player A's LLM harness  │            │ ┌──────────┐                                 │
+ │ (Claude Desktop)        │ MCP over   │ │          │   ┌─────────┐   ┌───────────┐   │
+ │  ┌──────────────────┐   │ Streamable │ │          │   │  World  │   │ Validator │   │
+ │  │ Claude (model)   │◄──┼────────────┼►│   MCP    │◄─►│  Engine │◄─►│ (perms,   │   │
+ │  │ + moo tools      │   │ HTTP(S):   │ │ Endpoint │   │ (single │   │ contracts,│   │
+ │  └──────────────────┘   │ tools,     │ │          │   │ writer) │   │invariants)│   │
+ └─────────────────────────┘ events,    │ │  (auth,  │   └────┬────┘   └───────────┘   │
+                             sampling   │ │   tool   │        │                        │
+ ┌─────────────────────────┐            │ │ dispatch,│   ┌────▼────┐   ┌───────────┐   │
+ │ Player B's LLM harness  │  MCP       │ │  notifi- │   │  Store  │   │  Referee  │   │
+ │ (Claude Code + skill)   │◄───────────┼►│  cations,│   │ (SQLite │   │ (server-  │   │
+ └─────────────────────────┘            │ │ sampling │   │  WAL)   │   │ side LLM  │   │
+                                        │ │  relay)  │   └─────────┘   │  client)  │   │
+ ┌─────────────────────────┐            │ │          │                 └───────────┘   │
+ │ Player C's LLM harness  │  MCP       │ │          │   ┌─────────┐                   │
+ └─────────────────────────┘◄───────────┼►│          │◄─►│  Event  │                   │
+                                        │ │          │   │   Bus   │                   │
+                                        │ └──────────┘   └─────────┘                   │
+                                        └──────────────────────────────────────────────┘
 ```
 
-- **NL-MOO server (Go).** Authoritative process holding the object database, permission system, method registry, effect validator, transaction queue, and event bus. It also embeds an MCP server (Streamable HTTP transport) exposing the tools of Section 7.
+- **NL-MOO server (Go).** Authoritative process holding the object database, permission system, method registry, effect validator, transaction queue, and event bus. Its sole client-facing surface is the embedded **MCP endpoint** (`internal/mcp`; Streamable HTTP transport), where every client connection terminates: it authenticates the bearer token, dispatches tool calls inward to the engine, relays event-bus deliveries outward as notifications, and brokers sampling requests. Clients never reach the internal components directly.
 - **Player LLM harnesses.** Each player runs their own Claude Desktop / Claude Code / other MCP client, connected to the server with a per-player bearer token. The harness's model does two jobs: (a) translating the player's natural language into tool calls, and (b) — when the harness supports MCP *sampling* — executing NL methods on the server's behalf under the sealed-execution protocol of Section 8.
 - **Referee.** A server-side LLM client (calls the Anthropic API with a server-held key) used for: methods flagged `integrity: high`, audits of client-executed methods, dispute resolution, and fallback when a client cannot execute. The referee is the only LLM the server *trusts*, and even its output passes through the same validator.
 - **Store.** SQLite in WAL mode (via a pure-Go driver so cross-compilation stays painless). The entire world state, event log, and method registry live here.
