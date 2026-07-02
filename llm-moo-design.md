@@ -1,9 +1,9 @@
 # NL-MOO: A Design for an LLM-Mediated, Multi-User Shared Object World
 
-**Status:** Draft for review
-**Author:** Claude (at Fran's request)
-**Date:** 2026-07-02
-**Implementation language (server):** Go
+**Status:** Draft for review  
+**Author:** Claude (at Fran's request)  
+**Date:** 2026-07-02  
+**Implementation language (server):** Go  
 **Client integration:** MCP (Model Context Protocol) and/or Agent Skills
 
 ---
