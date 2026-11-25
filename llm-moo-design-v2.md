@@ -992,6 +992,8 @@ A genie is here, arms folded.
 
 8. **Failure semantics as a default.** Section 8.6 supports both all-or-nothing and narrate-around-it via `calls_may_fail`. Which should be the *default* is a game-design question as much as an engineering one, and the answer probably differs between infrastructure (all-or-nothing) and flavor (narrate around). Watch what builders actually write.
 
+9. **What exactly is a `MechanicalRule`?** Sections 4.3 and 7.4 lean heavily on mechanical methods, and the type appears in the `Rule *MechanicalRule` field on `Method` (Section 4.3), the JSON `rule` column of the `methods` table (Section 5), and `internal/world/mechanical.go` (Section 14.1), but the document never defines the type itself. Section 4.3 describes it only informally as "guard conditions over properties, plus a fixed effect list with template messages." Before mechanical methods can be implemented, the format needs a precise definition: the Go struct and its JSON serialization; the guard language (which property comparisons and boolean connectives are allowed, and how guards reference `this`, the actor, and command arguments); how the effect list maps onto the same effects document that NL inferences produce, so that one validation path covers both; how template messages are written and which variables they may use; and what happens when no guard matches. It also has to stay small enough that `validate.go` can check a rule against its method's `EffectContract` statically. **Recommendation: settle this before the implementation milestone that introduces mechanical methods, starting from what the shipped prototypes (`take`, `drop`, `give`, `look`, and the generic container's open/close/lock) actually need.**
+
 ---
 
 *End of document.*
