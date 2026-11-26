@@ -27,6 +27,7 @@
 15. [Performance and Cost](#15-performance-and-cost)
 16. [A Worked Example Session](#16-a-worked-example-session)
 17. [Open Questions](#17-open-questions)
+18. [Future Enhancements](#18-future-enhancements)
 
 ---
 
@@ -993,6 +994,33 @@ A genie is here, arms folded.
 8. **Failure semantics as a default.** Section 8.6 supports both all-or-nothing and narrate-around-it via `calls_may_fail`. Which should be the *default* is a game-design question as much as an engineering one, and the answer probably differs between infrastructure (all-or-nothing) and flavor (narrate around). Watch what builders actually write.
 
 9. **What exactly is a `MechanicalRule`?** Sections 4.3 and 7.4 lean heavily on mechanical methods, and the type appears in the `Rule *MechanicalRule` field on `Method` (Section 4.3), the JSON `rule` column of the `methods` table (Section 5), and `internal/world/mechanical.go` (Section 14.1), but the document never defines the type itself. Section 4.3 describes it only informally as "guard conditions over properties, plus a fixed effect list with template messages." Before mechanical methods can be implemented, the format needs a precise definition: the Go struct and its JSON serialization; the guard language (which property comparisons and boolean connectives are allowed, and how guards reference `this`, the actor, and command arguments); how the effect list maps onto the same effects document that NL inferences produce, so that one validation path covers both; how template messages are written and which variables they may use; and what happens when no guard matches. It also has to stay small enough that `validate.go` can check a rule against its method's `EffectContract` statically. **Recommendation: settle this before the implementation milestone that introduces mechanical methods, starting from what the shipped prototypes (`take`, `drop`, `give`, `look`, and the generic container's open/close/lock) actually need.**
+
+---
+
+## 18. Future Enhancements
+
+This section collects ideas that are deliberately deferred: they are outside the current implementation milestone plan, and nothing in the milestones depends on them. They are recorded here so that the design keeps room for them, and so that early implementation choices do not accidentally rule them out. Unlike Section 17, these are not unresolved questions about the core design; they are additions that are expected to be worth building once the core world works. Each entry says what the enhancement is, why it is wanted, and how it fits the existing architecture. Details marked as proposals are suggestions to be settled when the enhancement is actually scheduled, not decisions.
+
+### 18.1 Dual listeners: telnet and a custom client
+
+**What it is.** The server listens on two TCP ports at once. The first is the telnet port, which speaks the plain line-oriented protocol described in Section 9.2 and serves any telnet program or classic MUD/MOO client. The second is a custom high-numbered port that serves a purpose-built NL-MOO client with advanced terminal features. Both listeners lead into the same session manager and the same world; they differ only in how bytes on the wire become lines in and text out.
+
+**Why.** Section 3.3 argues that zero client requirements is a real feature, and Section 17.2 recommends telnet-only for the first release. Both remain true: the telnet port is the compatibility guarantee, and it must keep working with nothing more than a stock telnet program. But a text world whose actions can take several seconds of inference (Section 15.1) benefits from things a raw telnet stream cannot do well, such as a real "thinking" indicator in place of the printed beat of Section 9.2, an input line that is not scrambled by output arriving while the player types, and scrollback that survives reconnection. Putting the richer protocol on its own port, rather than negotiating it on the telnet port, keeps the telnet path simple and guarantees that a classic client never receives bytes it does not understand. Section 17.2 suggested a capability handshake on connect as an alternative; a separate port is a different answer to the same question, and is the simpler of the two because neither protocol has to detect or tolerate the other.
+
+**How it fits.** Section 3.1 already makes the session manager the only component that knows about sockets, terminals, or text formatting, and everything inward of it deals in structured events. That boundary is what makes this enhancement cheap. The proposal is to split the session layer (`internal/session/`, Section 14.1) into a shared core and two front ends:
+
+- **Shared core.** Authentication (`connect <player> <password>` against `players.pw_hash`), the hybrid parser of Section 9.1, per-session preferences, and the subscription to the event bus (Section 10) are identical for both ports. A player is the same player object, with the same quotas, budgets, permissions, and event sequence numbers, whichever port they connected through. A player could even be connected through both ports at once, subject to whatever multiple-connection policy the session manager adopts for a single port.
+- **Telnet front end.** Reads and writes lines, renders events to wrapped text with optional ANSI color, and prints the latency beat. It should perform minimal, conservative telnet option negotiation (proposal): refuse or ignore options it does not implement, and optionally support NAWS (RFC 1073) so the wrap width can follow the client's window instead of requiring `@set width=`. Options that classic MUD clients use, such as GMCP or MSDP, are possible later additions but are not part of this entry.
+- **Custom-client front end.** Carries the same structured events that the event bus already produces, rather than pre-rendered text, and leaves the final rendering to the client. "Advanced terminal features" is not yet defined; candidate features (proposal) include a separate, editable input line with history; split panes for room description, conversation, and command output; a structured progress indication while an inference is pending; local aliases; and catch-up on missed events using the sequence numbers of Section 10. The wire format is open; a framed stream of JSON messages is the obvious starting point because the server already deals in JSON effects documents.
+
+**Configuration.** Both listen addresses belong in `moosd.toml` (Section 14.4), and each port should be independently enabled or disabled so that an operator can run telnet only, the custom client only, or both. The specific port numbers are proposals: the telnet port should default to a conventional MOO port (LambdaMOO's servers commonly used 7777 or 8888) rather than port 23, which requires elevated privileges on most systems, and the custom-client port should default to a fixed, documented port above 1024 so that the client knows where to connect without being told.
+
+**Open points.**
+
+- **Transport security.** Section 13.4 already expects operators to expose telnet through TLS or SSH, and says a custom client should use TLS by default. Whether the custom-client port should require TLS outright, offer it optionally, or leave it to a reverse proxy is unsettled, as is how certificates are configured for a small self-hosted world.
+- **Authentication on the custom port.** It can reuse the telnet `connect` command, or it can use a structured login message. Either way, passwords stay argon2id-hashed, and nothing about the custom port should weaken the login rules that apply on the telnet port.
+- **Protocol versioning.** A custom client and server will evolve at different rates, so the custom protocol should carry a version number from its first message, even if only version 1 ever exists.
+- **The client itself.** This entry assumes the client is a separate program, most likely written in Go to share types with the server. Where it lives (this repository or its own) and whether it is built at all are decisions for when the enhancement is scheduled.
 
 ---
 
