@@ -236,6 +236,7 @@ type Method struct {
     Rule      *MechanicalRule // Non-nil for mechanical methods: guard
                               // conditions over properties plus a fixed effect
                               // list with template messages. Evaluated in Go.
+                              // Section 4.5 proposes the exact format.
     Body      string          // Non-empty for NL methods: the prose program.
 
     Contract  EffectContract  // The machine-checkable envelope of allowed
@@ -254,7 +255,7 @@ type Method struct {
 }
 ```
 
-**Mechanical methods** have no prose body. Their behavior is a small declarative rule: guard conditions over properties, plus a fixed effect list with template messages. `take`, `drop`, `give`, `look`, and the generic container's open/close/lock are mechanical on the shipped prototypes.
+**Mechanical methods** have no prose body. Their behavior is a small declarative rule: guard conditions over properties, plus a fixed effect list with template messages (Section 4.5 proposes a precise format, pending review). `take`, `drop`, `give`, `look`, and the generic container's open/close/lock are mechanical on the shipped prototypes.
 
 Mechanical methods are not a compromise or an optimization of last resort — they are the correct implementation for the majority of a MOO's verbs, because those verbs are *fully determined by state* and need interpretation only for flavor. Taking a lamp involves no judgment: either it is takeable and present, or it is not. Spending three seconds and a fraction of a cent to have a language model discover this is waste, and it makes the world feel broken to anyone whose fingers remember what `take lamp` used to cost.
 
@@ -274,6 +275,308 @@ The permission model is deliberately a close copy of LambdaMOO's, because thirty
 - A method executes **with the authority of its owner**, not its caller — LambdaMOO's rule, and an essential one. If Fran's vending machine moves a soda from the machine to a buyer, that move is permission-checked against *Fran's* rights over the machine and the soda; the buyer needs no rights at all. This is what makes rich interactions between strangers' objects possible.
 
 Because methods run with owner authority, caller identity is *not* the primary safety rail on what a method can do. The **effect contract** is (Section 7.2). Owner authority says what the method's owner *could* do; the contract says what this particular method is *allowed* to do, and the validator enforces the intersection.
+
+### 4.5 Mechanical rules (Proposed, pending review)
+
+**Status: Proposed (pending review).** This subsection answers Section 17 item 9 with a concrete definition of `MechanicalRule`. Nothing in it is decided until Fran approves it. It is written in the indicative mood ("the evaluator does X") because that is easier to read, but every rule below is a proposal, and the open points at the end name the parts that most need a decision. It refines the suggested default for item B1 of the implementation plan (`nl-moo-implementation-plan.md` in the `fpl9000/nl-moo` repository), chiefly by replacing "one guard plus an else branch" with an ordered list of guarded cases, and by requiring guards to produce booleans instead of relying on truthiness.
+
+#### What the format must do
+
+Section 4.3 describes a mechanical method informally as "guard conditions over properties, plus a fixed effect list with template messages." Turning that into something the engine can run, store, and check imposes six requirements, and the proposal is shaped by them:
+
+1. **One JSON value.** A rule is stored in the `rule` column of the `methods` table (Section 5) as a single JSON object, so the schema needs no change.
+2. **One enforcement path.** Evaluating a rule produces an effects document of exactly the shape an NL inference produces (Section 7.3), which then passes through validator steps 2–6 (Section 7.4) unchanged. A rule is never trusted merely because it is deterministic Go.
+3. **Statically checkable.** At save time, `@program` can prove that every effect a rule could ever produce is covered by the method's `EffectContract`, using only the rule and the contract, with no inference and no world state. This is what Section 17 item 9 asks of `validate.go`.
+4. **Bounded evaluation.** The language is deliberately not Turing-complete: no loops, no recursion, no user-defined functions, no variables that can be reassigned, and no quantifiers over sets. Every evaluation finishes in time proportional to the size of the rule and of the lists it touches, so a rule can run on the world-writer goroutine without any risk of stalling it.
+5. **Readable.** LambdaMOO's culture of reading other people's verbs (Section 9.3) should survive. A rule printed by `@show` should be understandable by a builder who has never seen the grammar.
+6. **Writable by both audiences.** The Programmer agent (Section 11.1) generates rules when it "mechanizes" a method, and wizards write the shipped prototypes' rules by hand (and, until the Programmer exists, through `@program/raw`). The format must be easy for a language model to emit correctly and for a person to type.
+
+#### The Go types
+
+```go
+// MechanicalRule is the program of a mechanical method (Section 4.3): an
+// ordered list of guarded cases, each producing a fixed outcome. It is stored
+// as one JSON object in the methods.rule column (Section 5). Expressions,
+// selectors and templates are kept as source text in the stored form;
+// @program parses and checks them once at save time, and the engine caches
+// the parsed form with the method, so evaluation never re-parses text.
+type MechanicalRule struct {
+    Version int        `json:"v"`               // Format version. Always 1 for now.
+    Draws   int        `json:"draws,omitempty"` // Server random draws to make before
+                                                // evaluating (Section 7.6), 0..8.
+                                                // Non-zero requires Contract.Random.
+    Cases   []RuleCase `json:"cases"`           // Tried in order; the first whose guard
+                                                // is true is selected. May be empty.
+    Else    *Outcome   `json:"else,omitempty"`  // Used when no guard is true. If nil,
+                                                // the engine's default refusal is used.
+}
+
+// RuleCase is one guarded branch. Outcome is embedded, so in JSON its fields
+// sit beside "when" rather than inside a nested object.
+type RuleCase struct {
+    When Expr `json:"when"` // The guard. Must evaluate to a boolean.
+    Outcome
+}
+
+// Outcome is what a selected branch produces. Its fields map one-to-one onto
+// the fields of an effects document (Section 7.3).
+type Outcome struct {
+    Result   Result        `json:"result"`             // "ok" or "refuse".
+    Effects  []EffectTmpl  `json:"effects,omitempty"`  // Must be empty if Result is "refuse".
+    Messages []MessageTmpl `json:"messages,omitempty"` // Allowed for both results.
+    Reason   string        `json:"reason,omitempty"`   // Copied to the document's "reason".
+}
+
+// EffectTmpl is an effects-document entry whose object, destination and
+// value are filled in when the rule is evaluated. Version 1 supports the two
+// ops that effects documents define today, set_prop and move.
+type EffectTmpl struct {
+    Op    string          `json:"op"`              // "set_prop" | "move"
+    Obj   Selector        `json:"obj"`             // The object changed or moved.
+    Prop  string          `json:"prop,omitempty"`  // set_prop: a literal property name.
+    Value json.RawMessage `json:"value,omitempty"` // set_prop: a literal JSON value...
+    Expr  Expr            `json:"expr,omitempty"`  // ...or a computed one; exactly one.
+    To    Selector        `json:"to,omitempty"`    // move: the destination.
+}
+
+// MessageTmpl is an effects-document message whose text is a template.
+type MessageTmpl struct {
+    Scope   Selector   `json:"scope"`             // Who hears it. Must appear in
+                                                  // Contract.Messages.
+    Text    Template   `json:"text"`              // Text with {expr} placeholders.
+    Exclude []Selector `json:"exclude,omitempty"` // e.g. ["caller"] for text written
+                                                  // in the third person.
+}
+
+type Expr string     // Source text of a guard or value expression (grammar below).
+type Template string // Message text with {expr} placeholders (rules below).
+type Selector string // A Section 7.2 selector: "this", "caller.location", "#412", ...
+type Result string   // "ok" | "refuse"
+```
+
+Parsing is strict, as Section 7.4 step 1 requires of effects documents: unknown fields are rejected, `v` must be `1`, `set_prop` must carry `prop` and exactly one of `value` and `expr`, `move` must carry `to`, and fields that do not belong to an op (a `to` on a `set_prop`, say) are errors rather than being ignored. A literal `"value": null` is legitimate and means "set the property to null"; it is distinct from omitting `value`.
+
+Three design choices in these types deserve a sentence each:
+
+- **Ordered cases rather than one guard.** Almost every real verb has more than one way to fail, and each failure deserves its own message: "you already have that," "it won't budge," "it's locked." With a single guard and an else branch, the else branch cannot tell the player *which* condition failed. An ordered list of cases, tried top to bottom with the first true guard winning, is the familiar `if / else if / else` (or Lisp's `cond`) and handles this naturally.
+- **Targets are selectors, never computed.** An effect's `obj` and `to`, and a message's `scope`, are selectors in the Section 7.2 sense, not arbitrary expressions. Only a `set_prop` *value* may be computed. This restriction is what makes requirement 3 decidable: checking that `{"op": "move", "obj": "this", "to": "caller"}` is covered by a contract's `{"object": "this", "to": ["caller"]}` is a comparison of strings, whereas checking a computed target against a contract would require knowing what the computation could return.
+- **Source text, parsed once.** Storing expressions as text keeps `@show` output readable and keeps the JSON small. The cost of parsing is paid once, when the method is saved, which is also when every error that can be found without world state is reported to the builder.
+
+#### The expression language
+
+Guards (`when`), computed values (`expr`), and template placeholders all use one small expression language. Its grammar, in EBNF:
+
+```
+expr     = and { "||" and } ;
+and      = unary { "&&" unary } ;
+unary    = "!" unary | compare ;
+compare  = sum [ ( "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" ) sum ] ;
+sum      = primary { ( "+" | "-" ) primary } ;
+primary  = literal | path | call | "(" expr ")" ;
+path     = root { "." name } ;
+root     = "this" | "caller" | "dobj" | "iobj" | "prep" | "args" | "event"
+         | objid | "$" name ;
+call     = name "(" [ expr { "," expr } ] ")" ;
+literal  = number | string | "true" | "false" | "null"
+         | "[" [ literal { "," literal } ] "]" ;
+objid    = "#" [ "-" ] digit { digit } ;
+```
+
+`number` is a JSON number (it may be negative; there is no unary minus operator), `string` is a JSON string literal in double quotes with JSON's escapes, and `name` is a letter or underscore followed by letters, digits, or underscores. Comparisons do not chain: `a < b < c` is a syntax error rather than a surprise. `&&` and `||` short-circuit, which matters because it lets a guard test that something exists before reading from it (`valid(dobj) && dobj.open`).
+
+**Roots.** `this` is the object the command was invoked on (as in LambdaMOO, this is the object the method was *found through*, which may be a descendant of the object that defines it), and `caller` is the player or object that invoked it, matching the design's existing use of these words in selectors. `dobj`, `iobj`, and `prep` are the command's direct object, indirect object, and preposition, and `args` is a map of named string arguments; their exact meaning depends on plan item B2 (method signatures), so these names are provisional. A missing direct or indirect object is `#-1`. `event` is the payload of the engine event that triggered a hook method (Section 4.3), such as the object that arrived for `on_enter`; it is `null` for command methods. `#412` is a literal object reference, and `$container` is the object named by `#0.container`, which depends on plan item B4.
+
+**Values.** An expression evaluates to one of seven kinds of value: null, boolean, number, string, object reference, list, or map. These are JSON's types plus object references, and object references follow the convention chosen in M1: a JSON string that is exactly an object ID in canonical form (`"#1023"`) is a reference. So a property whose stored value is `"#78"` evaluates to the object `#78`.
+
+**Paths.** `x.name` reads from `x` as follows. If `x` is an object, the names `name`, `aliases`, `location`, `contents`, `parent`, and `owner` read the engine-maintained fields of Section 4.1, which anyone may read, and any other name reads a property, inherited through the parent chain exactly as Section 4.2 describes. If `x` is a map (a property whose value is a JSON object), `x.name` reads that key. Anything else is an error: reading through `#-1`, through a recycled object, through a string or number, a property the object does not have, or a map key that is absent. Errors here are deliberately strict, because the most common mistake in a hand-written rule is a misspelled property name, and treating a missing property as `null` would turn every typo into a guard that silently evaluates false.
+
+**Read permissions.** A rule runs with the authority of the method's owner (Section 4.4), and that applies to reads as well as writes. Each property read is checked against the owner's rights: the owner of the property's slot, a wizard, or anyone if the property has the `r` bit. A rule that tries to read a property its owner may not read stops with an error. This keeps a mechanical method from becoming a way to peek at someone else's unreadable properties.
+
+**Operators.** All operators are total and cheap:
+
+- `==` and `!=` compare any two values by deep structural equality; values of different kinds are simply unequal, so `this.price == "5"` is false when `price` is the number 5.
+- `<`, `<=`, `>`, and `>=` require two numbers. Anything else is an error, because "is `"apple"` less than `#12`?" has no useful answer.
+- `+` and `-` require two numbers, except that `+` also joins two strings. There is no multiplication or division, which removes divide-by-zero as a class of failure; arithmetic exists for counters and balances, such as `caller.gold - this.price`.
+- `x in list` is true if some element of the list equals `x`. The right-hand side must be a list.
+- `!`, `&&`, and `||` require booleans. There is no truthiness: `0`, `""`, `[]`, and `null` are not false, and `!this.contents` is an error. A guard must say what it means, such as `len(this.contents) == 0`. This differs from plan item B1, which listed truthiness, and the reason is that truthiness is a classic source of bugs in exactly the hand-written rules this language is for.
+
+**Functions.** There is a fixed set of built-in functions and no way to define new ones. None takes another expression as an argument (there is no `map` or `filter` over arbitrary conditions), which is what keeps the language free of user-controlled iteration:
+
+| Function | Result | Notes |
+|---|---|---|
+| `valid(x)` | boolean | True if `x` is a reference to a live object other than `#-1`. Accepts any value and never errors, so it is the safe first test of a guard. |
+| `has(x, "p")` | boolean | True if object `x` defines or inherits property `p`. |
+| `has_flag(x, "f")` | boolean | Tests an object flag (Section 4.1): `"player"`, `"room"`, `"exit"`, `"wizard"`, `"fertile"`, `"frozen"`, `"vehicle"`. |
+| `inside(x, y)` | boolean | True if `x` is `y` or is contained in `y` at any depth. Walks `x`'s location chain, which the containment-tree invariant (Section 6) guarantees is finite; capped at 64 hops as a defense, with an error beyond that. |
+| `len(x)` | number | Length of a list, or of a string in characters. |
+| `names(list)` | string | A list of objects rendered as English: their names joined as `"lamp"`, `"lamp and chest"`, or `"lamp, chest and couch"`, and `"nothing"` for an empty list. |
+| `without(list, x)` | list | The list with every element equal to `x` removed, typically to leave the caller out of a room's contents. |
+| `with_flag(list, "f")` / `without_flag(list, "f")` | list | The objects in the list that have (or lack) a flag, for example the exits or the players in a room. |
+| `min(a, b)` / `max(a, b)` | number | For clamping a computed value into a property's range. |
+| `random(i)` | number | The `i`-th server-supplied draw (Section 7.6), a uniform value in [0, 1). Valid only when `i < Draws`, which in turn requires the contract's `Random` flag. |
+
+Every function costs time proportional to its list argument at most, so the cost of a whole evaluation is bounded by the number of expression nodes times the length of the longest list touched, plus the 64-hop cap for `inside`. That bound is what requirement 4 asks for.
+
+#### Templates
+
+A message's `text` is literal text with placeholders of the form `{expr}`, where `expr` is any expression in the language above. `{{` and `}}` produce literal braces. A placeholder renders its value as follows: a string as itself; a number in its shortest form, with no decimal point for whole numbers; a boolean as `true` or `false`; null as `nothing`; an object reference as the object's `name`; and a list of objects as `names()` would render it. Rendering a map, or a list containing anything other than objects, is an error. After rendering, the first letter of the message is capitalized, so `"{this} won't budge."` reads correctly at the start of a sentence.
+
+Values interpolated into a template frequently come from players (object names, for instance), so the renderer strips control characters from them before they reach the session layer, which keeps a player-chosen name from carrying terminal escape sequences into other players' screens.
+
+This is deliberately not Go's `text/template` package, despite the plan's mention of "`text/template`-style placeholders" for M5. `text/template` has loops (`range`), can call methods on its data, and has its own expression syntax, which would give rule authors two languages and reintroduce the unbounded evaluation that requirement 4 rules out.
+
+#### Evaluation
+
+The evaluator lives in `internal/world/mechanical.go` (Section 14.1). Because a rule evaluates in microseconds, the proposal is to run it on the world-writer goroutine (Section 14.3), against current state, inside the same transaction that commits its effects. That has a pleasant consequence: no other write can intervene between reading and committing, so the freshness check of Section 7.4 step 5 always passes, and mechanical methods never suffer the optimistic-concurrency conflicts of Section 6. The steps are:
+
+1. **Bind.** Resolve `this`, `caller`, `dobj`, `iobj`, `prep`, `args`, and `event` for this invocation.
+2. **Draw.** If `Draws` is non-zero, take that many values from the server's RNG and record them, so that the outcome can be reproduced and the draws audited.
+3. **Select.** Evaluate each case's `when` in order. The first that is `true` selects that case's outcome. If none is true, select `Else`; if `Else` is absent, select the engine's default refusal, which is `{"result": "refuse"}` with the message "You can't do that." to `caller`. An evaluation error in any guard stops evaluation at once; later cases are not tried.
+4. **Instantiate.** For the selected outcome, resolve each effect's `obj` and `to` selectors to object IDs, evaluate each `expr`, and render each message. *All of these are evaluated against the state as it was before any of the outcome's effects apply.* Effects do not see each other: in a rule that moves the caller and also tells `caller.location` that they have left, `caller.location` is the room being left. This matches how an NL inference produces a whole effects document from a single snapshot.
+5. **Emit.** Assemble an effects document (Section 7.3) with the outcome's `result`, the instantiated effects and messages, and its `reason`.
+6. **Validate and commit.** Pass the document, with the bindings used to produce it, through validator steps 2–6 of Section 7.4, exactly as for an NL inference: contract check, independent permission check for the method's owner, invariant and schema checks, freshness, then atomic commit and event emission.
+
+A `refuse` outcome is a successful execution that changes nothing, as Section 7.3 defines it; its messages are still delivered, which is how "The chest is locked." reaches the player.
+
+#### Save-time checks
+
+When `@program` (or the bootstrap loader) saves a mechanical method, it parses the rule and rejects it, with a diagnostic to the builder, if any of the following fails. Nothing here needs world state or an inference.
+
+- The JSON is well-formed, has no unknown fields, and stays within the size limits below.
+- Every expression and template parses, names only known roots and functions, and passes each function the right number of arguments.
+- Every `move` effect matches a `MoveRule` of the contract: some rule's `object` equals the effect's `obj` and that rule's `to` list contains the effect's `to`, compared as selectors after normalizing whitespace.
+- Every `set_prop` effect matches a `WriteRule`, whose `prop` must equal the effect's `obj` and `prop` joined with a dot (for example `this.open`). If the value is a literal, its JSON type must match the rule's type and lie within its range; if the value is computed and its type is evident from the expression (a comparison is boolean, an arithmetic result is a number, a string literal is a string), that type must match too. Values whose type cannot be known until runtime are checked at runtime.
+- Every message's `scope` appears in the contract's `Messages` list.
+- A `refuse` outcome has no effects, and a non-zero `Draws` comes with `Random: true` in the contract.
+
+Save also produces warnings, which do not block saving: a rule whose last case is not `true` and that has no `else` can fall through to the default refusal, and a `this.p` path naming a property that the object being programmed does not define or inherit is probably a typo.
+
+Because a saved rule has been proven to stay inside its contract, a contract-check failure at runtime means something changed after saving (a contract edited by hand, say) or indicates an engine bug, and either deserves a diagnostic. The runtime check still happens, because "one enforcement path" means the validator never takes a rule's word for anything, and because permissions and invariants can only be checked against the live world. The plan's M5 test that a deliberately out-of-contract rule is refused will therefore construct the rule directly in Go, bypassing the save-time check, to exercise the runtime path.
+
+#### Runtime errors
+
+An evaluation error (an unreadable or missing property, a read through `#-1`, a type error in an operator or function, an `inside` walk past its cap, a selector that does not resolve to an object, an unrenderable placeholder) stops evaluation and is handled exactly like a validator rejection (Section 7.4): nothing is committed, the player sees an in-world fizzle, and the object's owner receives a diagnostic naming the rule, the case, and the expression that failed. Errors are not the same as refusals. A refusal is a rule *working as intended* and saying no; an error is a rule that is broken and needs its builder's attention.
+
+#### Limits
+
+Proposed values, all of which can be raised later without changing the format: a whole rule at most 16 KB of JSON; at most 32 cases; at most 16 effects and 8 messages per outcome; each expression at most 1,000 characters and 200 parsed nodes; each template at most 1,000 characters; `Draws` at most 8. The limits exist to keep evaluation on the writer goroutine trivially cheap and `@show` output readable, not because any one of them is critical.
+
+#### How the other `Method` fields apply
+
+`Contract` applies to mechanical methods exactly as to NL ones, as Section 4.3 already says. `Signature`, `Owner`, and `Perms` are unchanged. `Reads` is not needed to bound a prompt, because there is no prompt, so for a mechanical method it is computed from the rule at save time (the set of paths the rule reads) and stored for `@show` and the Programmer, replacing anything the builder supplied. `Care` and `Budget` have no effect, because a mechanical rule consumes no inference and, in version 1, cannot call other methods.
+
+#### Worked example: `take` on the generic thing (`#5`)
+
+The method is defined on `#5` with a signature binding `take <this>` (the exact signature syntax awaits plan item B2), so `this` is the object being taken. Its contract allows one move and two message scopes:
+
+```json
+{
+  "moves":    [ { "object": "this", "to": ["caller"] } ],
+  "messages": [ "caller", "caller.location" ]
+}
+```
+
+Its rule tries three refusals in order, then succeeds. (The limit of ten carried objects is only an illustration of a guard that reads state other than `this`.)
+
+```json
+{
+  "v": 1,
+  "cases": [
+    { "when": "this.location == caller",
+      "result": "refuse",
+      "messages": [ { "scope": "caller", "text": "You already have the {this}." } ] },
+    { "when": "len(caller.contents) >= 10",
+      "result": "refuse",
+      "messages": [ { "scope": "caller", "text": "Your hands are full." } ] },
+    { "when": "!this.takeable",
+      "result": "refuse",
+      "messages": [ { "scope": "caller", "text": "The {this} won't budge." } ] }
+  ],
+  "else": {
+    "result": "ok",
+    "effects":  [ { "op": "move", "obj": "this", "to": "caller" } ],
+    "messages": [ { "scope": "caller", "text": "You take the {this}." },
+                  { "scope": "caller.location", "text": "{caller} takes the {this}.",
+                    "exclude": ["caller"] } ]
+  }
+}
+```
+
+(`takeable` is a boolean property the bootstrap database would define on `#5`, defaulting to true, so that builders can make fixtures by setting it false.) The save-time check passes: the single `move` matches the contract's `MoveRule`, and both message scopes are in `messages`. When Fran (`#88`), standing in `#77`, types `take lamp`, the parser resolves it to `invoke(#1023, "take")`, no guard is true, and the evaluator emits:
+
+```json
+{
+  "effects":  [ { "op": "move", "obj": "#1023", "to": "#88" } ],
+  "messages": [ { "scope": "caller", "text": "You take the brass lamp." },
+                { "scope": "caller.location", "text": "Fran takes the brass lamp.",
+                  "exclude": ["caller"] } ],
+  "result": "ok",
+  "reason": null
+}
+```
+
+That is indistinguishable in form from what the interpreter would have returned for an NL `take`, and it goes through the same validator. The difference is that it cost under a millisecond and no money.
+
+#### Worked example: `open` on the generic container (`#6`)
+
+```json
+{
+  "v": 1,
+  "cases": [
+    { "when": "this.open",
+      "result": "refuse",
+      "messages": [ { "scope": "caller", "text": "The {this} is already open." } ] },
+    { "when": "this.locked",
+      "result": "refuse",
+      "messages": [ { "scope": "caller", "text": "The {this} is locked." } ] }
+  ],
+  "else": {
+    "result": "ok",
+    "effects":  [ { "op": "set_prop", "obj": "this", "prop": "open", "value": true } ],
+    "messages": [ { "scope": "caller",
+                    "text": "You open the {this}. Inside you see {names(this.contents)}." },
+                  { "scope": "caller.location", "text": "{caller} opens the {this}.",
+                    "exclude": ["caller"] } ]
+  }
+}
+```
+
+The contract is `{"writes": [{"prop": "this.open", "type": "boolean"}], "messages": ["caller", "caller.location"]}`, and the literal `true` is checked against the `boolean` type at save time. Note that `this.open` and `this.locked` are used as guards directly, which is legal only because those properties hold booleans; if a builder stored `"yes"` in `locked`, the guard would fail with a type error rather than quietly treating a non-empty string as true. Because the method is found through inheritance, opening Michelle's chest `#2080`, a child of `#6`, binds `this` to `#2080`, and the effect writes `#2080.open`, which Section 4.4 permission-checks against the method's owner, the wizard who owns `#6`.
+
+A short third case shows why evaluating against the pre-effect state is the convenient choice. The generic exit's `go` method moves the caller to the exit's destination and tells both rooms:
+
+```json
+{ "v": 1, "cases": [],
+  "else": { "result": "ok",
+    "effects":  [ { "op": "move", "obj": "caller", "to": "this.destination" } ],
+    "messages": [ { "scope": "caller.location", "text": "{caller} leaves {this}.",
+                    "exclude": ["caller"] },
+                  { "scope": "this.destination", "text": "{caller} arrives." } ] } }
+```
+
+Here `caller.location` names the room being left, because effects do not see each other. (The `this.destination` scope assumes the first open point below is settled in favor of selector scopes.)
+
+#### Alternatives considered
+
+- **An existing expression language.** Google's Common Expression Language (CEL, with the `cel-go` implementation) is the strongest candidate: it is designed for exactly this kind of embedded, non-Turing-complete policy expression, has guaranteed termination, and can estimate evaluation cost. It was not chosen because it brings a large dependency tree (protocol buffers and a generated parser) into a project whose plan prefers dependency-free code, because its macros (`all`, `exists`, `map`, `filter`) quantify over lists in exactly the way Section 17 item 3 is cautious about, and because `validate.go` needs to inspect the parsed expression directly, which is simplest with an AST the project owns. A hand-rolled parser for the grammar above is a few hundred lines of Go. If the language ever needs to grow substantially, moving to CEL is the natural escape hatch.
+- **An embedded scripting language** such as Starlark or Lua. Rejected: these are programming languages, which reintroduces the very barrier NL-MOO replaced with prose (Section 2), and bounding their execution takes step counters and sandboxing that a non-Turing-complete language makes unnecessary.
+- **Go's `text/template`** for messages. Rejected for the reasons given under Templates.
+- **Expressions as JSON trees** (in the style of JsonLogic, where `a == b` is written `{"==": [a, b]}`). This needs no parser and is trivial for a model to emit, but it is hard for people to read and write, and `@show` would have to render it back to infix form anyway. Storing source text costs one small parser and keeps the stored form, the `@show` form, and the hand-written form identical.
+- **A single guard with an else branch** (plan item B1's default). Replaced by ordered cases so that each failure gets its own message, as explained above.
+- **Truthiness in guards** (also in B1's default). Replaced by strict booleans, as explained under Operators.
+- **Sequential effect semantics**, where each effect sees the ones before it. Rejected: it would make a rule's outcome depend on the order of its effect list, and it would diverge from NL effects documents, which are computed from one snapshot.
+
+#### Open points
+
+1. **Message scopes as selectors.** Section 7.2 defines `Scope` as `"caller" | "caller.location" | "owner" | obj ID`. Mechanical prototypes need more: `give` must tell its recipient (`iobj`), and `go` must tell the destination room (`this.destination`). The proposal is to make a scope any selector that resolves to an object, which means the M2 contract types and the selector grammar of plan item B3 should allow it.
+2. **Command bindings.** The roots `dobj`, `iobj`, `prep`, and `args` depend on plan item B2, and `event` depends on defining each hook's payload (Section 4.3 names the hooks but not their payloads). `$name` depends on plan item B4. All of them are also selectors, so B3 should include them.
+3. **Fallbacks for NL methods.** Section 12.5 says that when a player's daily budget runs out, `routine` and `normal` actions "degrade to mechanical behavior," Section 15.4 mentions hooks' "mechanical fallbacks," and the `mechanical_only` switch of Section 14.4 assumes something mechanical runs in place of NL methods. But the `Method` type allows a rule *or* a body, never both, so an NL method has no mechanical fallback to degrade to. Options: (a) the fallback is the nearest ancestor's mechanical method of the same name, if there is one, and otherwise a terse refusal, which needs no schema change; or (b) NL methods gain an optional `Fallback *MechanicalRule`. Option (a) is suggested.
+4. **Calls from and into mechanical methods.** Version 1 forbids a rule from calling other methods, which keeps it a leaf. Whether rules should gain a `call` effect, or something like LambdaMOO's `pass()` (run the parent's version of this method after a child's own guards), is open. The reverse direction, an NL method whose contract calls a mechanical method, needs a decision in the M11 composition work: the orchestrator can evaluate a mechanical callee directly instead of inlining it, but its arguments may depend on what the NL caller decides, so it may have to run after the inference rather than before.
+5. **Creating objects.** A `create` op is excluded until plan item B6 settles how effects documents create objects and refer to them before they have IDs. Dispensers and similar devices are good candidates for mechanical creation once it exists.
+6. **Articles, pronouns, and capitalization.** The examples write "the {this}" by hand and rely on first-letter capitalization. LambdaMOO had pronoun substitutions (`%s`, `%o`, `%p` and their capitalized forms) for "he/she/they" and possessives, and names like "Michelle" must not get "the" in front of them. Whether templates need pronoun and article helpers, and how they interact with player-chosen pronouns, is open.
+7. **Overlap with event descriptions.** Section 10 says movement produces templated event prose such as "Fran arrives from the north." If the engine narrates moves itself, rules like `go` should not narrate them a second time. Which layer owns movement prose needs deciding before the prototypes are written.
+8. **Where failures are logged.** The `executions` table (Section 5) records inferences, and mechanical methods are not inferences. Successful mechanical executions are adequately recorded by the events they emit, but errors and rejections need to be kept somewhere a builder (and the Curator of Section 11.2) can find them. Reusing `executions` with `model = 'mechanical'` is the obvious candidate, but its columns (`snapshot_ref`, `raw_output`) assume an inference.
+9. **Limits and the random-draw feature.** The limits above are guesses, and `Draws` could be deferred entirely if no shipped prototype needs chance; it is included because Section 7.6 makes randomness a server property and a mechanical "cursed coin" is a natural example.
 
 ---
 
@@ -829,7 +1132,7 @@ moosd/
 │   ├── object.go         // Object, Property, Method, ObjID, flags
 │   ├── perms.go          // The Section 4.4 rules, in one auditable file
 │   ├── engine.go         // Writer goroutine: apply(Tx) with OCC read-set checks
-│   ├── mechanical.go     // MechanicalRule evaluation: the no-inference path
+│   ├── mechanical.go     // MechanicalRule evaluation (Sec 4.5): the no-inference path
 │   └── snapshot.go       // StateSelector resolution -> sealed-context JSON
 ├── internal/store/       // SQLite persistence; load-on-boot, write-through
 ├── internal/contract/    // EffectContract, selectors, the validator pipeline
@@ -993,7 +1296,7 @@ A genie is here, arms folded.
 
 8. **Failure semantics as a default.** Section 8.6 supports both all-or-nothing and narrate-around-it via `calls_may_fail`. Which should be the *default* is a game-design question as much as an engineering one, and the answer probably differs between infrastructure (all-or-nothing) and flavor (narrate around). Watch what builders actually write.
 
-9. **What exactly is a `MechanicalRule`?** Sections 4.3 and 7.4 lean heavily on mechanical methods, and the type appears in the `Rule *MechanicalRule` field on `Method` (Section 4.3), the JSON `rule` column of the `methods` table (Section 5), and `internal/world/mechanical.go` (Section 14.1), but the document never defines the type itself. Section 4.3 describes it only informally as "guard conditions over properties, plus a fixed effect list with template messages." Before mechanical methods can be implemented, the format needs a precise definition: the Go struct and its JSON serialization; the guard language (which property comparisons and boolean connectives are allowed, and how guards reference `this`, the actor, and command arguments); how the effect list maps onto the same effects document that NL inferences produce, so that one validation path covers both; how template messages are written and which variables they may use; and what happens when no guard matches. It also has to stay small enough that `validate.go` can check a rule against its method's `EffectContract` statically. **Recommendation: settle this before the implementation milestone that introduces mechanical methods, starting from what the shipped prototypes (`take`, `drop`, `give`, `look`, and the generic container's open/close/lock) actually need.**
+9. **What exactly is a `MechanicalRule`?** Sections 4.3 and 7.4 lean heavily on mechanical methods, and the type appears in the `Rule *MechanicalRule` field on `Method` (Section 4.3), the JSON `rule` column of the `methods` table (Section 5), and `internal/world/mechanical.go` (Section 14.1), but the document never defines the type itself. Section 4.3 describes it only informally as "guard conditions over properties, plus a fixed effect list with template messages." Before mechanical methods can be implemented, the format needs a precise definition: the Go struct and its JSON serialization; the guard language (which property comparisons and boolean connectives are allowed, and how guards reference `this`, the actor, and command arguments); how the effect list maps onto the same effects document that NL inferences produce, so that one validation path covers both; how template messages are written and which variables they may use; and what happens when no guard matches. It also has to stay small enough that `validate.go` can check a rule against its method's `EffectContract` statically. **Recommendation: settle this before the implementation milestone that introduces mechanical methods, starting from what the shipped prototypes (`take`, `drop`, `give`, `look`, and the generic container's open/close/lock) actually need.** **Status (Nov 26, 2026):** Section 4.5 now contains a proposed definition, pending Fran's review. This item stays open until that proposal is approved or revised, and Section 4.5 ends with the sub-questions it leaves open.
 
 ---
 
